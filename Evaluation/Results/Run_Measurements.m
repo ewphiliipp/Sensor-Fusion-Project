@@ -1,0 +1,680 @@
+%% Batch Runne
+clc; clear; close all;
+
+results_path = pwd;                 
+script_root  = fullfile(results_path, '..');  
+
+cd(script_root);
+
+run_dirs = dir('Run*');
+run_dirs = run_dirs([run_dirs.isdir]);
+
+for RUN_IDX__ = 1:numel(run_dirs)
+
+    cd(run_dirs(RUN_IDX__).name);
+    
+    %% 1. Sensor Data Acquisition & Synchronization
+    disp('Step 1: Data Acquisition & Synchronization (100 Hz)');
+
+
+    Accel = readtable('Accelerometer.csv');
+    Gyro   = readtable('Gyroscope.csv');
+    Gps    = readtable('Location.csv');
+    DGM    = readtable("GPS_DGM.csv");
+    Mag    = readtable('Magnetometer.csv');
+    Baro   = readtable("Barometer.csv");
+
+    % Get all the time information from the data.
+    t_acc  = Accel.Time_s_;
+    t_gyro = Gyro.Time_s_;
+    t_gps  = Gps.Time_s_;
+    t_mag  = Mag.Time_s_;
+    t_baro = Baro.Time_s_;
+    t_all = [t_acc; t_gyro; t_gps; t_mag; t_baro];
+        
+
+    t0 = min(t_all);
+    t_end = max(t_all);
+    fs = 100; 
+    dt = 1/fs;
+    t_common = (t0:dt:t_end)';
+    N = length(t_common);
+    
+    % Accel
+    Accel_interp.x = fillmissing(interp1(t_acc, Accel.X_m_s_2_, t_common, 'linear', 'extrap'), 'linear');
+    Accel_interp.y = fillmissing(interp1(t_acc, Accel.Y_m_s_2_, t_common, 'linear', 'extrap'), 'linear');
+    Accel_interp.z = fillmissing(interp1(t_acc, Accel.Z_m_s_2_, t_common, 'linear', 'extrap'), 'linear');
+    
+    % Gyro
+    Gyro_interp.x = fillmissing(interp1(t_gyro, Gyro.X_rad_s_, t_common, 'linear', 'extrap'), 'linear');
+    Gyro_interp.y = fillmissing(interp1(t_gyro, Gyro.Y_rad_s_, t_common, 'linear', 'extrap'), 'linear');
+    Gyro_interp.z = fillmissing(interp1(t_gyro, Gyro.Z_rad_s_, t_common, 'linear', 'extrap'), 'linear');
+    
+    % Mag
+    Mag_interp.x = fillmissing(interp1(t_mag, Mag.X__T_, t_common, 'linear', 'extrap'), 'linear');
+    Mag_interp.y = fillmissing(interp1(t_mag, Mag.Y__T_, t_common, 'linear', 'extrap'), 'linear');
+    Mag_interp.z = fillmissing(interp1(t_mag, Mag.Z__T_, t_common, 'linear', 'extrap'), 'linear');
+    
+    % GPS Position & Alt
+    Gps_interp.lat = fillmissing(interp1(t_gps, Gps.Latitude___, t_common, 'linear', 'extrap'), 'linear');
+    Gps_interp.lon = fillmissing(interp1(t_gps, Gps.Longitude___, t_common, 'linear', 'extrap'), 'linear');
+    Gps_interp.alt = fillmissing(interp1(t_gps, DGM.DGM_Height_m, t_common, 'linear', 'extrap'), 'linear');
+    
+    % GPS Velocity & Heading
+    Gps_interp.vel = fillmissing(interp1(t_gps, Gps.Velocity_m_s_, t_common, 'linear', 'extrap'), 'constant', 0); 
+    Gps_interp.heading = fillmissing(interp1(t_gps, Gps.Direction___, t_common, 'linear', 'extrap'), 'previous');
+    
+    % GNSS- velocity in ENU
+    Gps_ENU_Vel.x = Gps_interp.vel .* sind(Gps_interp.heading);
+    Gps_ENU_Vel.y = Gps_interp.vel .* cosd(Gps_interp.heading);
+    Gps_ENU_Vel.z = zeros(N, 1);
+    
+    % Barometer Pressure
+    Baro_P_interp = interp1(t_baro, Baro.X_hPa_, t_common, 'linear', 'extrap'); 
+    
+    % prepare the data to be stored in a table
+    timetable_vars = {Accel_interp.x, Accel_interp.y, Accel_interp.z, ...
+                      Gyro_interp.x, Gyro_interp.y, Gyro_interp.z, ...
+                      Mag_interp.x, Mag_interp.y, Mag_interp.z, ...
+                      Gps_interp.lat, Gps_interp.lon, Gps_interp.alt,...
+                      Baro_P_interp};
+
+    timetable_names = {'Accel_x','Accel_y','Accel_z', 'Gyro_x','Gyro_y','Gyro_z', ...
+                       'Mag_x','Mag_y','Mag_z', 'GPS_lat','GPS_lon','GPS_alt', 'Baro_P'};
+        
+    % all the data will be stored in this synchronized table
+    timetable_synced = timetable(seconds(t_common - t0), timetable_vars{:}, 'VariableNames', timetable_names);
+
+
+    %% 2. Preprocessing & Calibration
+    disp('Step 2: Preprocessing & Calibration');
+    acc = [timetable_synced.Accel_x timetable_synced.Accel_y timetable_synced.Accel_z];
+    gyro = [timetable_synced.Gyro_x timetable_synced.Gyro_y timetable_synced.Gyro_z];
+    Mag  = [timetable_synced.Mag_x timetable_synced.Mag_y timetable_synced.Mag_z];
+
+    % Compute norms
+    acc_norm = sqrt(sum(acc.^2,2));
+    gyro_norm = sqrt(sum(gyro.^2,2));
+    
+    % find stationary window
+    g_ref = 9.81; 
+    acc_thresh_fixed  = 0.1;
+    gyro_thresh_fixed = deg2rad(1.0); 
+    is_stationary = abs(acc_norm - g_ref) < acc_thresh_fixed & gyro_norm < gyro_thresh_fixed;
+    is_stationary = movmedian(is_stationary, 100) > 0.5;
+    t_min_idx = max(1, round(10 / dt)); 
+    is_stationary(1:t_min_idx) = false;
+    
+    % Fallback if no stationary points were found to a window of 100 frames
+    % with the lowest variance
+    if sum(is_stationary) < 20
+        disp("No stationary region detected, using lowest variance segment.");
+        win = movstd(acc_norm, 100);
+        [~, idx_min] = min(win);
+        idx_min = max(1, idx_min-50) : min(length(acc_norm), idx_min+50);
+        is_stationary(idx_min) = true;
+    end
+    
+    % compute sensor biases
+    bias_acc  = mean(acc(is_stationary,:), 1);
+    bias_gyro = mean(gyro(is_stationary,:), 1);
+    bias_Mag  = mean(Mag(is_stationary,:), 1);
+
+    % remove bias and filter data
+    Accel_detrend = acc - bias_acc;
+    Gyro_detrend  = gyro - bias_gyro;
+    Mag_detrend   = Mag - bias_Mag;
+    [b, a] = butter(4, 20/(fs/2), 'low'); 
+    Accel_filt = filtfilt(b, a, Accel_detrend);
+    Gyro_filt  = filtfilt(b, a, Gyro_detrend);
+
+    % Normalize magnetometer to unit vector
+    Mag_norm = sqrt(sum(Mag_detrend.^2,2));
+    Mag_unit = Mag_detrend ./ Mag_norm;
+    
+    % update table and save everything
+    timetable_preprocessed = timetable_synced;
+    timetable_preprocessed.Accel_x = Accel_filt(:,1); 
+    timetable_preprocessed.Accel_y = Accel_filt(:,2);
+    timetable_preprocessed.Accel_z = Accel_filt(:,3);
+    timetable_preprocessed.Gyro_x  = Gyro_filt(:,1);
+    timetable_preprocessed.Gyro_y  = Gyro_filt(:,2);
+    timetable_preprocessed.Gyro_z  = Gyro_filt(:,3);
+    timetable_preprocessed.Mag_x   = Mag_unit(:,1);
+    timetable_preprocessed.Mag_y   = Mag_unit(:,2);
+    timetable_preprocessed.Mag_z   = Mag_unit(:,3);
+    
+    %% 3. AHRS + ZUPT 
+
+    disp('Step 3: AHRS + ZUPT parameter optimizer');
+    
+    % setting betas for madgewick and threshholds for zupt
+    beta_list = [0.01 0.03 0.05 0.1]; 
+    acc_thresh_list = [0.1 0.15 0.2];
+    gyro_thresh_list = deg2rad([2, 3, 4]); 
+    
+    length_run = size(Accel_filt,1);
+    best_score = Inf;
+    res = [];
+    idx_res = 1;
+    
+    for bval = beta_list
+        for at = acc_thresh_list
+            for gt = gyro_thresh_list
+                
+                % Create the AHRS object with current test parameters
+                AHRS = MadgwickAHRS('SamplePeriod', dt, 'Beta', bval);
+                
+                Qtest = zeros(length_run, 4);
+                roll = zeros(length_run,1); pitch = zeros(length_run,1); yaw = zeros(length_run,1);
+                
+                % Set initial state
+                Qtest(1,:) = AHRS.Quaternion;
+                
+                for k = 2:length_run
+                    % Execute the Update method 
+                    AHRS.Update(Gyro_filt(k,:), Accel_filt(k,:), Mag_unit(k,:));
+                    
+                    % Extract results
+                    q_new = AHRS.Quaternion;
+                    Qtest(k,:) = q_new;
+                    
+                    % Convert Quaternions to Euler angles
+                    roll(k)  = atan2(2*(q_new(1)*q_new(2)+q_new(3)*q_new(4)), 1-2*(q_new(2)^2+q_new(3)^2));
+                    pitch(k) = asin( max(-1,min(1,2*(q_new(1)*q_new(3)-q_new(4)*q_new(2)))) );
+                    yaw(k)   = atan2(2*(q_new(1)*q_new(4)+q_new(2)*q_new(3)), 1-2*(q_new(3)^2+q_new(4)^2));
+                end
+                
+                roll_deg = rad2deg(roll); 
+                pitch_deg = rad2deg(pitch); 
+                yaw_deg = rad2deg(yaw);
+                
+                % detecting ZUPT
+                accel_norm_f = sqrt(sum(Accel_filt.^2,2));
+                gyro_norm_f  = sqrt(sum(Gyro_filt.^2,2));
+                % Identify stationary phases based on current thresholds
+                zupt_raw = (abs(accel_norm_f - 9.81) < at) & (gyro_norm_f < gt);
+                % Filter noise using moving median
+                zupt = movmedian(double(zupt_raw), 7) > 0.5;
+                
+                % Evaluate smoothness, heading drift, and physiological ZUPT ratio 
+                smoothness = var(diff(roll_deg)) + var(diff(pitch_deg));
+                yaw_drift = abs(yaw_deg(end) - yaw_deg(1));
+                zupt_ratio = mean(zupt);
+                zupt_penalty = abs(zupt_ratio - 0.12);
+                
+                total_score = smoothness + 5*yaw_drift + 80*zupt_penalty;
+                res(idx_res,:) = [bval, at, gt, total_score, zupt_ratio];
+                
+                % Store the best configuration
+                if total_score < best_score
+                    best_score = total_score;
+                    best_struct.beta = bval;
+                    best_struct.acc_thresh = at;
+                    best_struct.gyro_thresh = gt;
+                    best_struct.roll_deg = roll_deg;
+                    best_struct.pitch_deg = pitch_deg;
+                    best_struct.yaw_deg = yaw_deg;
+                    best_struct.zupt = zupt;
+                    best_struct.Q = Qtest;
+                end
+                idx_res = idx_res + 1;
+            end
+        end
+    end
+    
+    % save results in array
+    results = array2table(res, 'VariableNames', {'beta','acc_thresh','gyro_thresh','score','zupt_ratio'});
+    best_beta = best_struct.beta;
+    % Apply 20% safety margin to thresholds for the final EKF run
+    best_acc_thresh = best_struct.acc_thresh * 0.8;
+    best_gyro_thresh = best_struct.gyro_thresh * 0.8;
+    
+    fprintf('Optimizer done. Best beta=%.3f accT=%.3f gyroT=%.3f\n', best_beta, best_acc_thresh, best_gyro_thresh);
+    
+    calibration_log.ahrs = best_struct;
+    % Update timetable with optimized orientation data
+    timetable_orientation = addvars(timetable_preprocessed, best_struct.roll_deg, best_struct.pitch_deg, best_struct.yaw_deg, ...
+        best_struct.Q(:,1), best_struct.Q(:,2), best_struct.Q(:,3), best_struct.Q(:,4), ...
+        'NewVariableNames', {'Roll_Madgwick_deg','Pitch_Madgwick_deg','Yaw_Madgwick_deg','Q_w','Q_x','Q_y','Q_z'});
+    timetable_orientation.ZUPT = best_struct.zupt;
+    
+    
+    % 4. EXTENDED KALMAN FILTER 
+    disp('Step 4: EKF Framework & Adaptive R-Tuning');
+    
+    g_mag = 9.81;
+    g_vec = [0; 0; -g_mag];      % world-frame gravity (Z up)
+    
+    N = length(t_common);
+    
+    
+    % GNSS POSITION: Convert to ENU
+    
+    [first_valid] = find(~isnan(timetable_orientation.GPS_lat),1,'first');
+    if isempty(first_valid)
+        error('No GNSS data found.');
+    end
+    
+    lat0 = timetable_orientation.GPS_lat(first_valid);
+    lon0 = timetable_orientation.GPS_lon(first_valid);
+    alt0 = timetable_orientation.GPS_alt(first_valid);
+    
+    [xEast,yNorth,zUp] = equirectangular_enu( ...
+            timetable_orientation.GPS_lat, ...
+            timetable_orientation.GPS_lon, ...
+            timetable_orientation.GPS_alt, ...
+            lat0, lon0, alt0);
+    
+    Gps_ENU = [fillmissing(xEast,'linear'), ...
+               fillmissing(yNorth,'linear'), ...
+               fillmissing(zUp,'linear')];
+    
+    Gps_ENU = double(Gps_ENU);
+
+    % 10 second smoothing window
+    gps_win = 10 * fs; 
+    
+    % Glättung der ENU-Koordinaten
+    Gps_ENU(:,1) = movmean(Gps_ENU(:,1), gps_win);
+    Gps_ENU(:,2) = movmean(Gps_ENU(:,2), gps_win);
+    
+    % GNSS VELOCITY → ENU
+    
+    Gps_ENU_Vel_x = double(Gps_interp.vel .* sind(Gps_interp.heading));
+    Gps_ENU_Vel_y = double(Gps_interp.vel .* cosd(Gps_interp.heading));
+    Gps_ENU_Vel_z = zeros(N,1);
+    
+    
+    % EKF INITIAL STATE AND COVARIANCE
+    
+    x = zeros(9,1);
+    x(1:3) = Gps_ENU(1,:)';
+    
+    P = eye(9) * 1;
+    
+    if isscalar(dt)
+        dt_sample_def = double(dt);
+    else
+        dt_sample_def = double(dt(1));
+    end
+    
+    Q_base = diag([
+        1e-4; 1e-4; 1e-4;    % position
+        1.0;  1.0;  1.0;     % velocity
+        1e-4; 1e-4; 1e-4     % bias
+    ]);
+    
+    Q = Q_base * dt_sample_def;
+    
+    assert(isequal(size(Q),[9 9]), 'EKF: Q must be 9x9');
+    
+    R_gps = diag([15^2, 15^2, 30^2]);         % GNSS Position
+    R_vel_gps = diag([0.8^2, 0.8^2, 0.8^2]);   % GNSS Velocity
+    R_zupt = diag([0.01, 0.01, 0.01]);            % Zero-Velocity Update
+    
+    x_hist = zeros(N,9);
+    P_hist = zeros(9,9,N);
+    x_hist(1,:) = x';
+    P_hist(:,:,1) = P;
+    
+    for k = 2:N
+        
+        dt_sample = dt_sample_def;
+    
+        qk = double([ ...
+            timetable_orientation.Q_w(k), ...
+            timetable_orientation.Q_x(k), ...
+            timetable_orientation.Q_y(k), ...
+            timetable_orientation.Q_z(k) ]);
+    
+        Rwb = quatToRotMat(qk);   % body→world 3×3
+    
+        F = eye(9);
+        F(1:3,4:6) = dt_sample * eye(3);
+    
+        acc_body = double([ ...
+            timetable_orientation.Accel_x(k); ...
+            timetable_orientation.Accel_y(k); ...
+            timetable_orientation.Accel_z(k) ]);
+    
+        bias_est = x(7:9);
+    
+        a_world = Rwb * (acc_body - bias_est) + g_vec;
+    
+        x_pred = x;
+        x_pred(1:3) = x(1:3) + x(4:6) * dt_sample + 0.5 * a_world * dt_sample^2;
+        x_pred(4:6) = x(4:6) + a_world * dt_sample;
+    
+        F(4:6,7:9) = -Rwb * dt_sample;
+    
+        P = F * P * F' + Q;
+    
+        z = [];
+        H = [];
+        Rm = [];
+        do_update = false;
+    
+        % GNSS POSITION
+        if ~any(isnan(Gps_ENU(k,:)))
+            z = [z; Gps_ENU(k,:)'];
+            H = [H; [eye(3), zeros(3,6)]];
+            Rm = blkdiag(Rm, R_gps);
+            do_update = true;
+        end
+    
+        % GNSS VELOCITY
+        if ~isnan(Gps_ENU_Vel_x(k)) && Gps_interp.vel(k) > 0.1
+            z = [z; Gps_ENU_Vel_x(k); Gps_ENU_Vel_y(k); Gps_ENU_Vel_z(k)];
+            H = [H; [zeros(3), eye(3), zeros(3)]];
+            Rm = blkdiag(Rm, R_vel_gps);
+            do_update = true;
+        end
+    
+        % ZERO VELOCITY UPDATE
+        if timetable_orientation.ZUPT(k)
+            z = [z; 0;0;0];
+            H = [H; [zeros(3), eye(3), zeros(3)]];
+            Rm = blkdiag(Rm, R_zupt);
+            do_update = true;
+        end
+    
+        if do_update
+            y = z - H * x_pred;
+            S = H * P * H' + Rm;
+    
+            if rcond(S) < 1e-12
+                S = S + 1e-8 * eye(size(S));
+            end
+    
+            K = (P * H') / S;
+    
+            x = x_pred + K * y;
+            P = (eye(9) - K * H) * P;
+    
+        else
+            x = x_pred;
+        end
+    
+        x_hist(k,:) = x';
+        P_hist(:,:,k) = P;
+    end
+    
+    timetable_fused = addvars( ...
+        timetable_orientation, ...
+        x_hist(:,1), x_hist(:,2), x_hist(:,3), ...
+        x_hist(:,4), x_hist(:,5), x_hist(:,6), ...
+        x_hist(:,7), x_hist(:,8), x_hist(:,9), ...
+        'NewVariableNames', { ...
+            'EKF_Pos_x','EKF_Pos_y','EKF_Pos_z', ...
+            'EKF_Vel_x','EKF_Vel_y','EKF_Vel_z', ...
+            'EKF_Bias_x','EKF_Bias_y','EKF_Bias_z'});
+
+    %% STEP 5: Claculating elevation
+    disp('Step 5: Barometer Elevation calculation');
+
+    % 1. converting Barometer to elevation estimation 
+    P_ref = 1013.25; 
+    alt_raw = 44330 * (1 - (timetable_synced.Baro_P / P_ref).^(1/5.255));
+    
+    % 2. massive smoothing to reduce noise and reduce small differences
+    alt_smooth = movmean(alt_raw, 60 * fs); 
+    
+    % 3. 20-second downsampling
+    sample_interval = 20 * fs;
+    t_idx = 1:sample_interval:length(alt_smooth);
+
+    % making sure, that the last index is also getting used.
+    if t_idx(end) ~= length(alt_smooth)
+        t_idx = [t_idx, length(alt_smooth)]; 
+    end
+
+    alt_steps = alt_smooth(t_idx);
+    
+    % 4. Hysterese-Filter (threshhold of 20cm)
+    threshold = 0.20; 
+    current_ref_alt = alt_steps(1);
+    Elevation_Gain = 0;
+    Elevation_Loss = 0;
+    
+    for i = 2:length(alt_steps)
+        diff_val = alt_steps(i) - current_ref_alt;
+        
+        if diff_val > threshold
+            Elevation_Gain = Elevation_Gain + diff_val;
+            current_ref_alt = alt_steps(i); 
+        elseif diff_val < -threshold
+            Elevation_Loss = Elevation_Loss + abs(diff_val);
+            current_ref_alt = alt_steps(i); 
+        end
+    end
+    
+    % 5. save data
+    timetable_fused.Vertical_Alt_Smoothed = interp1(t_common(t_idx), alt_steps, t_common, 'previous', 'extrap');
+    
+    fprintf('Gain = %.2f m | Loss = %.2f m\n', Elevation_Gain, Elevation_Loss);
+
+    %% STEP 6: HYBRID DISTANCE & VELOCITY calcultaion
+    disp('Step 6: Calculating Hybrid Distance (loosley coupled fusion)');
+    
+    % prepare timevector
+    tvec = double(seconds(timetable_fused.Time - timetable_fused.Time(1)));
+    
+    % weighing of ekf
+    alpha_dist = 0.2; 
+    
+    % calulate eucledian distance for gps
+    dx_gps = [0; diff(Gps_ENU(:,1))];
+    dy_gps = [0; diff(Gps_ENU(:,2))];
+    dist_inc_gps = sqrt(dx_gps.^2 + dy_gps.^2);
+    
+    % calulate eucledian distance for EKF
+    dx_ekf = [0; diff(timetable_fused.EKF_Pos_x)];
+    dy_ekf = [0; diff(timetable_fused.EKF_Pos_y)];
+    dist_inc_ekf = sqrt(dx_ekf.^2 + dy_ekf.^2);
+    
+    % Hybrid-Integration
+    hybrid_inc = (alpha_dist * dist_inc_ekf) + ((1 - alpha_dist) * dist_inc_gps);
+    
+    % Noise cut off: we only add the distnce, if the velocity is above 0.1
+    % m/s to avoid adding gps jitter
+    velocity_est = hybrid_inc / dt; 
+    moving_mask = velocity_est > 0.1; 
+    hybrid_inc(~moving_mask) = 0;
+    
+    % calculate total distance
+    Distance_m_hybrid = cumsum(hybrid_inc);
+    
+    % save results
+    timetable_fused.Vel_H = velocity_est .* moving_mask;
+    timetable_fused.Distance_m = Distance_m_hybrid;
+    
+    fprintf('Weighted result: Distance = %.1f m (Alpha EKF: %.2f)\n', ...
+    Distance_m_hybrid(end), alpha_dist);
+   
+    %% 7. KPI Calculation (Strictly Limited Metrics)
+    disp('Step 7: Calculating specific KPIs (Distance, Elevation, Pace)');
+    
+    % Get the name of the current directory to use as Run Name (e.g., "Run1_dist")
+    current_path = pwd;
+    path_parts = strsplit(current_path, filesep);
+    run_name = path_parts{end}; 
+    
+    % Time and distance conversion for Pace calculation
+    total_dist_km = timetable_fused.Distance_m(end) / 1000;
+    total_time_min = (seconds(timetable_fused.Time(end)) - seconds(timetable_fused.Time(1))) / 60;
+    
+    % Pace Calculation (min/km)
+    % Filter for movement > 0.5 m/s to get meaningful values
+    pace_raw = 1000 ./ (timetable_fused.Vel_H * 60);
+    moving_mask = timetable_fused.Vel_H > 0.1; 
+    
+    if any(moving_mask)
+        % Average pace over total distance
+        avg_pace_val = total_time_min / total_dist_km;
+        % Min pace = fastest pace (minimum value)
+        min_pace_val = min(pace_raw(moving_mask)); 
+        % Max pace = slowest pace while moving (maximum value)
+        max_pace_val = max(pace_raw(moving_mask)); 
+    else
+        avg_pace_val = NaN; min_pace_val = NaN; max_pace_val = NaN;
+    end
+    
+    % Create the strictly limited results table
+    Final_Results = table();
+    Final_Results.Run_Name = {run_name}; % Folder name from your directory structure
+    Final_Results.Distance_m = timetable_fused.Distance_m(end);
+    Final_Results.Elevation_Gain = Elevation_Gain;
+    Final_Results.Elevation_Loss = Elevation_Loss;
+    Final_Results.Min_Pace = min_pace_val;
+    Final_Results.Max_Pace = max_pace_val;
+    Final_Results.Avg_Pace = avg_pace_val;
+    
+    disp('FINAL RESULTS');
+    disp(Final_Results);
+    
+    %% 8. Updated Global Logging 
+    disp('Step 8: Smart Logging to Results folder...');
+    
+    % Path setup
+    output_folder = fullfile('..', 'Results');
+    if ~exist(output_folder, 'dir'), mkdir(output_folder); end
+    log_filename = fullfile(output_folder, 'global_kpi_log.csv');
+    
+    % Prepare the new data row
+    % Run Name detection (e.g., "Run1_dist")
+    current_path = pwd;
+    path_parts = strsplit(current_path, filesep);
+    current_run = path_parts{end};
+    
+    % Current values in a temporary table
+    newResults = table({current_run}, timetable_fused.Distance_m(end), Elevation_Gain, Elevation_Loss, ...
+        min_pace_val, max_pace_val, avg_pace_val, ...
+        'VariableNames', {'Run_Name', 'Distance_m', 'Elevation_Gain', 'Elevation_Loss', 'Min_Pace', 'Max_Pace', 'Avg_Pace'});
+    
+    if isfile(log_filename)
+        % 1. Load existing table to preserve GT columns
+        opts = detectImportOptions(log_filename);
+        opts.VariableNamingRule = 'preserve';
+        fullTable = readtable(log_filename, opts);
+        
+        % 2. Check if the current Run_Name already exists
+        rowIdx = find(strcmp(fullTable.Run_Name, current_run));
+        
+        if ~isempty(rowIdx)
+            % Overwrite ONLY calculated columns for the existing row
+            fullTable.Distance_m(rowIdx) = newResults.Distance_m;
+            fullTable.Elevation_Gain(rowIdx) = newResults.Elevation_Gain;
+            fullTable.Elevation_Loss(rowIdx) = newResults.Elevation_Loss;
+            fullTable.Min_Pace(rowIdx) = newResults.Min_Pace;
+            fullTable.Max_Pace(rowIdx) = newResults.Max_Pace;
+            fullTable.Avg_Pace(rowIdx) = newResults.Avg_Pace;
+            fprintf(' Updated existing entry for %s. GT columns preserved.\n', current_run);
+        else
+            % Append new row, initialize GT columns with 0 if they exist in table
+            % This ensures the table structure stays consistent
+            newRow = array2table(zeros(1, width(fullTable)), 'VariableNames', fullTable.Properties.VariableNames);
+            newRow.Run_Name = {current_run};
+            newRow.Distance_m = newResults.Distance_m;
+            newRow.Elevation_Gain = newResults.Elevation_Gain;
+            newRow.Elevation_Loss = newResults.Elevation_Loss;
+            newRow.Min_Pace = newResults.Min_Pace;
+            newRow.Max_Pace = newResults.Max_Pace;
+            newRow.Avg_Pace = newResults.Avg_Pace;
+            
+            fullTable = [fullTable; newRow];
+            fprintf('➕ Added new entry for %s.\n', current_run);
+        end
+        
+        % 3. Save the updated table
+        writetable(fullTable, log_filename);
+    else
+        % Create a fresh file with empty GT columns
+        newResults.GT_Dist = 0;
+        newResults.GT_Ele = 0;
+        writetable(newResults, log_filename);
+        fprintf(' Created new log file with GT placeholders.\n');
+    end
+   
+    %% FINAL ANALYSIS FIGURE: EKF VS. GPS VS. BARO
+    disp(['Generating Stability Analysis for: ', run_name]);
+    
+    % 1. prepare data
+    t_plot_vec = seconds(timetable_fused.Time - timetable_fused.Time(1));
+    total_time = t_plot_vec(end);
+    
+    % 2. calculate ground truth for plotting
+    ele_search = dir('Elevation_run*.csv');
+    z_proc_gt = [];
+    gt_gain = 0;
+    if ~isempty(ele_search)
+        data_gt = readtable(ele_search(1).name);
+        z_raw = data_gt.Z_1; z_raw = z_raw(~isnan(z_raw));
+        z_int = round(z_raw, 1);
+        z_proc_gt = movmean(z_int, 5);
+        
+        gt_ref = z_proc_gt(1);
+        for k = 2:length(z_proc_gt)
+            dz = z_proc_gt(k) - gt_ref;
+            if dz >= 1
+                gt_gain = gt_gain + dz;
+                gt_ref = z_proc_gt(k);
+            elseif dz <= -1
+                gt_ref = z_proc_gt(k);
+            end
+        end
+        t_gt = linspace(0, total_time, length(z_proc_gt));
+    end
+    
+    % 3. create figure
+    fig_final = figure('Name', ['EKF Stability Check: ' run_name], 'Position', [100, 50, 1100, 900]);
+    
+    % subplot1: hotizontal evaluation (EKF VS. GPS)
+    subplot(2,1,1);
+    hold on; grid on; axis equal;
+    
+    % Raw GPS Path (ENU)
+    [gps_x, gps_y, ~] = equirectangular_enu(Gps_interp.lat, Gps_interp.lon, Gps_interp.alt, lat0, lon0, alt0);
+    plot(gps_x, gps_y, 'g:', 'LineWidth', 1.0, 'DisplayName', 'Raw GPS Path');
+    
+    % EKF Path
+    plot(timetable_fused.EKF_Pos_x, timetable_fused.EKF_Pos_y, 'r', 'LineWidth', 1.2, 'DisplayName', 'EKF Fused Path');
+    
+    % Start/End
+    plot(gps_x(1), gps_y(1), 'go', 'MarkerFaceColor', 'g', 'DisplayName', 'Start');
+    plot(gps_x(end), gps_y(end), 'ro', 'MarkerFaceColor', 'r', 'DisplayName', 'End');
+    
+    title(['Horizontal Stability: EKF vs. Raw GPS (', run_name, ')']);
+    xlabel('East [m]'); ylabel('North [m]');
+    legend('Location', 'best');
+    
+    % subplot 2: Vertical evaluation (EKF VS. BARO VS. GT)
+    subplot(2,1,2);
+    hold on; grid on;
+    
+    % 1. Raw GPS Altitude (often very noisy)
+    plot(t_plot_vec, Gps_interp.alt, 'g:', 'DisplayName', 'Raw GPS/DGM Alt');
+    
+    % 2. EKF Vertical Position (Check if IMU noise ruins this)
+    plot(t_plot_vec, timetable_fused.EKF_Pos_z, 'r', 'LineWidth', 1.2, 'DisplayName', 'EKF Z-Position');
+    
+    % 3. Barometer
+    plot(t_plot_vec, timetable_fused.Vertical_Alt_Smoothed, 'b', 'LineWidth', 2.0, 'DisplayName', 'Pure Baro (Smoothed)');
+    
+    % 4. Ground Truth
+    if ~isempty(z_proc_gt)
+        z_gt_aligned = z_proc_gt - z_proc_gt(1) + timetable_fused.Vertical_Alt_Smoothed(1);
+        plot(t_gt, z_gt_aligned, 'k', 'LineWidth', 1.5, 'DisplayName', 'Ground Truth');
+    end
+    
+    title('Vertical Stability: Why Baro wins over EKF/GPS');
+    xlabel('Time [s]'); ylabel('Altitude [m]');
+    legend('Location', 'best');
+    
+    % info box    
+    % Save
+    cd(script_root);
+
+end
+cd(results_path);
+disp('All runs processed.');
