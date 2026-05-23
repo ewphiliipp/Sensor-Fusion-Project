@@ -1,5 +1,3 @@
-# Sensor-Fusion-Project
-
 # Smartphone Sensor Fusion for Running Analysis
 
 A multi-sensor fusion pipeline that estimates **distance and elevation** during running using smartphone sensors.
